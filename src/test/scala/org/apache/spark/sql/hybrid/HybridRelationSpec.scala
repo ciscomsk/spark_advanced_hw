@@ -9,7 +9,8 @@ import java.lang
 /** testOnly org.apache.spark.sql.hybrid.HybridRelationSpec */
 /**
  * https://www.mongodb.com/compatibility/docker
- * docker run --name mongodb -d -p 27017:27017 mongo
+ * docker run --name mongodb -d -p 27017:27017 mongo - 1й раз
+ * docker start mongodc
  * docker exec -it 787a7f6ea3ce mongo
  *
  * use index_store

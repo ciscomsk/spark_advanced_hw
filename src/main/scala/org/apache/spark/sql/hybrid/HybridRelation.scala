@@ -6,7 +6,7 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.hybrid.MongoHelper.GenericObservable
 import org.apache.spark.sql.{DataFrame, Row, SQLContext, SaveMode, SparkSession}
-import org.apache.spark.sql.sources.{BaseRelation, CreatableRelationProvider, DataSourceRegister, RelationProvider, TableScan}
+import org.apache.spark.sql.sources.{BaseRelation, CreatableRelationProvider, DataSourceRegister, EqualTo, Filter, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual, PrunedFilteredScan, RelationProvider, TableScan}
 import org.apache.spark.sql.types.{DataType, LongType, Metadata, StructField, StructType}
 import org.bson.codecs.configuration.CodecRegistry
 import org.mongodb.scala.bson.ObjectId
@@ -14,6 +14,7 @@ import org.mongodb.scala.model.Filters
 import org.mongodb.scala.model.Filters.and
 import org.mongodb.scala.{Completed, Document, MongoClient, MongoCollection, MongoDatabase}
 
+import scala.collection.mutable
 import scala.io.{BufferedSource, Source}
 
 object MongoInteraction {
@@ -56,8 +57,8 @@ object MongoInteraction {
 }
 
 case class SchemaRec(_id: ObjectId, objectName: String, schemaRef: String, commitMillis: Long)
-
-case class FileRec(_id: ObjectId, objectName: String, path: String, commitMillis: Long)
+case class StatsRec(name: String, min: Int, max: Int)
+case class FileRec(_id: ObjectId, objectName: String, path: String, commitMillis: Long, columnStats: List[StatsRec])
 
 class HybridRelation extends CreatableRelationProvider
   with RelationProvider
@@ -95,15 +96,26 @@ class HybridRelation extends CreatableRelationProvider
     log.info(s"MONGO_URI: $mongoUri")
 
     iRdd.foreachPartition { partition =>
-      val jsonStringIter: Iterator[String] = new RowConverter(schema).toJsonString(partition)
+      val rowConverter: RowConverter = new RowConverter(schema)
+      val jsonStringIter: Iterator[String] = rowConverter.toJsonString(partition)
+      val stats: mutable.Map[String, (Int, Int)] = rowConverter.statistics
+      println(stats)
+//      val manualStats: mutable.Map[String, (Int, Int)] = mutable.Map("id2" -> 38, "id" -> 18)
+//      println(manualStats)
       val filePath: String = s"$saveDirectory/${java.util.UUID.randomUUID().toString}.json"
 
       FileHelper.write(filePath, jsonStringIter)
 
+      val mongoStats: List[Document] =
+        stats
+          .map { case (colName, (min, max)) => Document("name" -> colName, "min" -> min, "max" -> max) }
+          .toList
+
       val doc: Document = Document(
         "objectName" -> objectName,
         "path" -> filePath,
-        "commitMillis" -> System.currentTimeMillis()
+        "commitMillis" -> System.currentTimeMillis(),
+        "columnStats" -> mongoStats
       )
 
       val mongoConnection: MongoDatabase = MongoInteraction.connect(mongoUri)
@@ -140,7 +152,6 @@ class HybridRelation extends CreatableRelationProvider
     }
   }
 
-
   override def createRelation(sqlContext: SQLContext, parameters: Map[String, String]): BaseRelation = {
     log.info(s"${this.logName} has been created")
     log.info(s"${parameters.mkString(", ")}")
@@ -151,20 +162,18 @@ class HybridRelation extends CreatableRelationProvider
     val mongoUri: String = System.getenv("MONGO_URI")
     log.info(s"MONGO_URI: $mongoUri")
 
-//    val mongoConnection: MongoDatabase = MongoInteraction.connect(mongoUri).withCodecRegistry(codecRegistry)
-
-//    val docs: Seq[Document] = MongoInteraction.getSchemas(mongoConnection, "schema_index", objectName)
-//    println(docs)
-
     import org.mongodb.scala.bson.codecs.Macros._
     import org.mongodb.scala.MongoClient.DEFAULT_CODEC_REGISTRY
     import org.bson.codecs.configuration.CodecRegistries.{fromRegistries, fromProviders}
 
-    val codecRegistrySchema: CodecRegistry =
-      fromRegistries(fromProviders(classOf[SchemaRec]), DEFAULT_CODEC_REGISTRY )
+    val codecRegistry: CodecRegistry =
+      fromRegistries(
+        fromProviders(classOf[SchemaRec], classOf[FileRec], classOf[StatsRec]),
+        DEFAULT_CODEC_REGISTRY
+      )
 
-    val mongoConnectionSchema: MongoDatabase = MongoInteraction.connect(mongoUri).withCodecRegistry(codecRegistrySchema)
-    val schemasCollection: MongoCollection[SchemaRec] = mongoConnectionSchema.getCollection("schema_index")
+    val mongoConnection: MongoDatabase = MongoInteraction.connect(mongoUri).withCodecRegistry(codecRegistry)
+    val schemasCollection: MongoCollection[SchemaRec] = mongoConnection.getCollection("schema_index")
 
     val schemasList: List[DataType] =
       schemasCollection
@@ -194,27 +203,23 @@ class HybridRelation extends CreatableRelationProvider
 
     log.info(s"schemaWithMillis: $schemaWithMillis")
 
-    val codecRegistryFile: CodecRegistry =
-      fromRegistries(fromProviders(classOf[FileRec]), DEFAULT_CODEC_REGISTRY )
+    val filesCollection: MongoCollection[FileRec] = mongoConnection.getCollection("file_index")
 
-    val mongoConnectionFile: MongoDatabase = MongoInteraction.connect(mongoUri).withCodecRegistry(codecRegistryFile)
-    val filesCollection: MongoCollection[FileRec] = mongoConnectionFile.getCollection("file_index")
-
-    val params: Array[(String, Long)] =
+    val params: Array[(String, Long, Map[String, (Int, Int)])] =
       filesCollection
         .find(Filters.eq("objectName", objectName))
         .results()
-        .map(file => (file.path, file.commitMillis))
+        .map(file => (file.path, file.commitMillis, file.columnStats.map(st => st.name -> (st.min, st.max)).toMap))
         .toArray
 
-    log.info(s"filesList: ${parameters.mkString("Array(", ", ", ")")}")
+    log.info(s"params: ${params.mkString("Array(", ", ", ")")}")
 
     new HybridBaseRelation(params, schemaWithMillis)
   }
 }
 
-class HybridBaseRelation(parameters: Array[(String, Long)], usedSchema: StructType) extends BaseRelation
-  with TableScan
+class HybridBaseRelation(parameters: Array[(String, Long, Map[String, (Int, Int)])], usedSchema: StructType) extends BaseRelation
+  with PrunedFilteredScan
   with Logging {
 
   override def sqlContext: SQLContext =
@@ -226,33 +231,88 @@ class HybridBaseRelation(parameters: Array[(String, Long)], usedSchema: StructTy
 
   override def needConversion: Boolean = false
 
-  override def buildScan(): RDD[Row] = new HybridJsonRdd(parameters, schema).asInstanceOf[RDD[Row]]
+  override def buildScan(requiredColumns: Array[String], filters: Array[Filter]): RDD[Row] = {
+    log.info(s"Used filters: ${filters.mkString("Array(", ", ", ")")}")
+
+    val integerFilters =
+      filters
+        .filter {
+          case EqualTo(_, _) => false
+          case GreaterThan(_, _) => false
+          case GreaterThanOrEqual(_, _) => false
+          case LessThan(_, _) => false
+          case LessThanOrEqual(_, _) => false
+          case _ => true
+        }
+
+    val pushedFilters: Array[Filter] = filters.diff(integerFilters)
+    log.info(s"Pushed filters: ${pushedFilters.mkString("Array(", ", ", ")")}")
+
+    new HybridJsonRdd(parameters, schema, pushedFilters).asInstanceOf[RDD[Row]]
+  }
+
 }
 
-class HybridJsonRdd(parameters: Array[(String, Long)], schema: StructType) extends RDD[InternalRow](SparkSession.active.sparkContext, Nil) with Logging {
+class HybridJsonRdd(parameters: Array[(String, Long, Map[String, (Int, Int)])],
+                    schema: StructType,
+                    filters: Array[Filter]) extends RDD[InternalRow](SparkSession.active.sparkContext, Nil) with Logging {
+
   override def compute(split: Partition, context: TaskContext): Iterator[InternalRow] = {
     val hybridJsonPartition: HybridJsonPartition = split.asInstanceOf[HybridJsonPartition]
     val path: String = hybridJsonPartition.path
     val millis: Long = hybridJsonPartition.millis
+    val stats: Map[String, (Int, Int)] = hybridJsonPartition.stats
 
-    val file: BufferedSource = Source.fromFile(path)
-    val lines: Iterator[String] = file.getLines
+    val meetsCondition: Boolean =
+      filters
+        .map {
+          case EqualTo(attribute, value) =>
+            if (value.asInstanceOf[Int] >= stats(attribute)._1 && value.asInstanceOf[Int] <= stats(attribute)._2) true
+            else false
 
-    new JsonParser(schema)
-      .toRow(lines)
-      .map { iRow =>
-        iRow.update(0, millis)
-        iRow
-      }
+          case GreaterThan(attribute, value) =>
+            if (value.asInstanceOf[Int] < stats(attribute)._2) true
+            else false
+
+          case GreaterThanOrEqual(attribute, value) =>
+            if (value.asInstanceOf[Int] <= stats(attribute)._2) true
+            else false
+
+          case LessThan(attribute, value) =>
+            if (value.asInstanceOf[Int] > stats(attribute)._1) true
+            else false
+
+          case LessThanOrEqual(attribute, value) =>
+            if (value.asInstanceOf[Int] >= stats(attribute)._1) true
+            else false
+        }
+        .reduce(_ && _)
+
+    if (filters.isEmpty || meetsCondition) {
+      println("Meets conditions")
+      val file: BufferedSource = Source.fromFile(path)
+      val lines: Iterator[String] = file.getLines
+
+      new JsonParser(schema)
+        .toRow(lines)
+        .map { iRow =>
+          iRow.update(0, millis)
+          iRow
+        }
+    } else {
+      println("Doesn't meets conditions")
+      Iterator.empty
+    }
+
   }
 
   override protected def getPartitions: Array[Partition] =
     parameters
       .zipWithIndex
       .map {
-        case ((file, millis), idx) => HybridJsonPartition(file, millis, idx)
+        case ((file, millis, map), idx) => HybridJsonPartition(file, millis, idx, map)
       }
 }
 
-case class HybridJsonPartition(path: String, millis: Long, index: Int) extends Partition
+case class HybridJsonPartition(path: String, millis: Long, index: Int, stats: Map[String, (Int, Int)]) extends Partition
 

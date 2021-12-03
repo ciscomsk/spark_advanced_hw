@@ -108,6 +108,7 @@ class HybridRelation extends CreatableRelationProvider
 
       val mongoStats: List[Document] =
         stats
+//        manualStats
           .map { case (colName, (min, max)) => Document("name" -> colName, "min" -> min, "max" -> max) }
           .toList
 

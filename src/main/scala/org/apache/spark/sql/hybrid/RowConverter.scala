@@ -22,7 +22,7 @@ class RowConverter(dataType: StructType) {
       .fields
       .collect { case sf if sf.dataType == IntegerType => sf.name }
 
-  var statistics: mutable.Map[String, (Int, Int)] = mutable.Map.empty[String, (Int, Int)]
+  val statistics: mutable.Map[String, (Int, Int)] = mutable.Map.empty[String, (Int, Int)]
 
   def toJsonString(input: Iterator[InternalRow]): Iterator[String] =
     input.map { iRow =>

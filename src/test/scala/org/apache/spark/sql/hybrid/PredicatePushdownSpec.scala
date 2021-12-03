@@ -38,7 +38,7 @@ class PredicatePushdownSpec extends AnyFlatSpec with should.Matchers {
         .option("objectName", "test01")
         .load()
 
-    val filteredDf: Dataset[Row] = df.filter($"id2" === 40)
+    val filteredDf: Dataset[Row] = df.filter($"id2" >= 38)
     filteredDf.explain(extended = true)
     filteredDf.show(20, truncate = false)
   }

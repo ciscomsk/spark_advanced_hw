@@ -99,18 +99,19 @@ class HybridRelation extends CreatableRelationProvider
       val rowConverter: RowConverter = new RowConverter(schema)
       val jsonStringIter: Iterator[String] = rowConverter.toJsonString(partition)
       val stats: mutable.Map[String, (Int, Int)] = rowConverter.statistics
+      /** !!! IS EMPTY */
       println(stats)
-//      val manualStats: mutable.Map[String, (Int, Int)] = mutable.Map("id2" -> 38, "id" -> 18)
-//      println(manualStats)
       val filePath: String = s"$saveDirectory/${java.util.UUID.randomUUID().toString}.json"
 
       FileHelper.write(filePath, jsonStringIter)
 
       val mongoStats: List[Document] =
         stats
-//        manualStats
           .map { case (colName, (min, max)) => Document("name" -> colName, "min" -> min, "max" -> max) }
           .toList
+
+      /** !!! NOT EMPTY */
+      println(mongoStats)
 
       val doc: Document = Document(
         "objectName" -> objectName,
